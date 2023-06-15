@@ -11,6 +11,7 @@ extern crate test;
 use ::anyhow::Result;
 use ::demikernel::{
     QDesc,
+    QToken,
     LibOS,
     LibOSName,
     demi_sgarray_t,
@@ -359,47 +360,56 @@ fn server(args: &mut EchoMultiflowArg) -> ! {
     };
 
     let mut nr_pending: u64 = 0;
+    let mut qtokens: Vec<QToken> = Vec::new();
 
     loop {
         if nr_pending < 1 {
             // Accept incoming connections.
-            libos.accept(sockqd).unwrap();
+            let qt: QToken = libos.accept(sockqd).unwrap();
             nr_pending += 1;
+            qtokens.push(qt);
         }
 
-        let arr: Vec<demi_qresult_t> = libos.wait_any3();
+        let (idx, qr) = match libos.wait_any(&qtokens, None) {
+            Ok((idx, qr)) => (idx, qr),
+            Err(e) => panic!("operation failed: {:?}", e),
+        };
 
-        for qr in arr.iter() {
-            // Parse the result.
-            match qr.qr_opcode {
-                demi_opcode_t::DEMI_OPC_ACCEPT => {
-                    // Pop first packet.
-                    let qd: QDesc = unsafe { qr.qr_value.ares.qd.into() };
-                    libos.pop(qd, None).unwrap();
-                    nr_pending -= 1;
-                },
-                // Pop completed.
-                demi_opcode_t::DEMI_OPC_POP => {
-                    let qd: QDesc = qr.qr_qd.into();
-                    let mut sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
-                    
-                    unsafe {
-                        let iterations: u64 = *(((sga.sga_segs[0].sgaseg_buf as *mut u8).offset(32)) as *mut u64);
-                        let randomness: u64 = *(((sga.sga_segs[0].sgaseg_buf as *mut u8).offset(40)) as *mut u64);
-                        fakework.work(iterations, randomness);
-                    }
-                    
-                    libos.push(qd, &mut sga).unwrap();
-                    libos.sgafree(sga).unwrap();
-                },
-                // Push completed.
-                demi_opcode_t::DEMI_OPC_PUSH => {
-                    // Pop another packet.
-                    let qd: QDesc = qr.qr_qd.into();
-                    libos.pop(qd, None).unwrap();
-                },
-                _ => panic!("unexpected result"),
-            }
+        qtokens.remove(idx);
+
+        // Parse the result.
+        match qr.qr_opcode {
+            demi_opcode_t::DEMI_OPC_ACCEPT => {
+                // Pop first packet.
+                let qd: QDesc = unsafe { qr.qr_value.ares.qd.into() };
+                let qt: QToken = libos.pop(qd, None).unwrap();
+                nr_pending -= 1;
+                qtokens.push(qt);
+            },
+            // Pop completed.
+            demi_opcode_t::DEMI_OPC_POP => {
+                let qd: QDesc = qr.qr_qd.into();
+                let mut sga: demi_sgarray_t = unsafe { qr.qr_value.sga };
+                
+                unsafe {
+                    let iterations: u64 = *(((sga.sga_segs[0].sgaseg_buf as *mut u8).offset(32)) as *mut u64);
+                    let randomness: u64 = *(((sga.sga_segs[0].sgaseg_buf as *mut u8).offset(40)) as *mut u64);
+                    *(((sga.sga_segs[0].sgaseg_buf as *mut u8).offset(24)) as *mut u64) = queue_id as u64;
+                    fakework.work(iterations, randomness);
+                }
+                
+                let qt: QToken = libos.push(qd, &mut sga).unwrap();
+                libos.sgafree(sga).unwrap();
+                qtokens.push(qt);
+            },
+            // Push completed.
+            demi_opcode_t::DEMI_OPC_PUSH => {
+                // Pop another packet.
+                let qd: QDesc = qr.qr_qd.into();
+                let qt: QToken = libos.pop(qd, None).unwrap();
+                qtokens.push(qt);
+            },
+            _ => panic!("unexpected result"),
         }
     }
 
